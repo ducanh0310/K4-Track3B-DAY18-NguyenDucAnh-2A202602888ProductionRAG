@@ -29,8 +29,13 @@ def build_pipeline():
     print("\n[1/4] Chunking documents...", flush=True)
     docs = load_documents()
     all_chunks = []
+    parent_map = {}
     for doc in docs:
         parents, children = chunk_hierarchical(doc["text"], metadata=doc["metadata"])
+        for parent in parents:
+            pid = parent.metadata.get("parent_id")
+            if pid:
+                parent_map[pid] = parent.text
         for child in children:
             all_chunks.append({"text": child.text, "metadata": {**child.metadata, "parent_id": child.parent_id}})
     print(f"  ✓ {len(all_chunks)} chunks from {len(docs)} documents ({time.time()-t0:.1f}s)", flush=True)
@@ -49,6 +54,7 @@ def build_pipeline():
     t0 = time.time()
     print(f"\n[3/4] Indexing {len(all_chunks)} chunks (BM25 + Dense)...", flush=True)
     search = HybridSearch()
+    search.parent_map = parent_map
     search.index(all_chunks)
     print(f"  ✓ Indexed ({time.time()-t0:.1f}s)", flush=True)
 
@@ -66,7 +72,21 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
     results = search.search(query)
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
     reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
-    contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
+    top_candidates = reranked if reranked else results[:3]
+
+    parent_map = getattr(search, "parent_map", {})
+    contexts = []
+    seen = set()
+    for r in top_candidates:
+        meta = getattr(r, "metadata", {}) or {}
+        pid = meta.get("parent_id")
+        text_to_use = parent_map.get(pid, r.text) if pid else r.text
+        if text_to_use and text_to_use not in seen:
+            seen.add(text_to_use)
+            contexts.append(text_to_use)
+
+    if not contexts:
+        contexts = [r.text for r in top_candidates]
 
     from config import OPENAI_API_KEY
     if OPENAI_API_KEY and contexts:
@@ -74,10 +94,14 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
             from openai import OpenAI
             client = OpenAI()
             context_str = "\n\n".join(contexts)
-            resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
-                {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'"},
-                {"role": "user", "content": f"Context:\n{context_str}\n\nCâu hỏi: {query}"},
-            ])
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Bạn là chuyên gia giải đáp chính sách và quy định nội bộ của công ty. Dựa CHỈ vào context được cung cấp, hãy trả lời câu hỏi một cách chính xác, đầy đủ và súc tích bằng tiếng Việt. Nếu có chính sách cũ và mới (ví dụ v1 vs v2, v2023 vs v2024), hãy ưu tiên và nêu rõ quy định mới nhất hiện hành. Nếu context hoàn toàn không có thông tin để trả lời, trả lời: 'Không tìm thấy.'"},
+                    {"role": "user", "content": f"Context:\n{context_str}\n\nCâu hỏi: {query}"},
+                ],
+                temperature=0.0
+            )
             answer = resp.choices[0].message.content
         except Exception as e:
             print(f"  ⚠️  LLM generation failed: {e}", flush=True)
